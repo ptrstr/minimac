@@ -77,6 +77,9 @@ jobs:
     env:
       XCODE_INPUT: ${{ inputs.xcode }}
       TARGET_ARCH: ${{ inputs.arch }}
+      # Contents/MacOS/xtool is the SwiftUI app. Without XTL_CLI=1 it starts a
+      # GUI and hangs headlessly instead of running the CLI.
+      XTL_CLI: "1"
 
     steps:
       - uses: actions/download-artifact@v4
