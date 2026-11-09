@@ -13,7 +13,7 @@ on:
         options: [x86_64, arm64]
         default: x86_64
       xtool_version:
-        description: "xtool release tag (must match your local xtool)"
+        description: "xtool release tag"
         type: string
         default: "1.24.0"
 
@@ -21,67 +21,112 @@ permissions:
   contents: read
 
 jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch xtool and SDK build inputs
+        shell: bash
+        env:
+          XTOOL_VERSION: ${{ inputs.xtool_version }}
+          TARGET_ARCH: ${{ inputs.arch }}
+        run: |
+          set -euxo pipefail
+          case "$TARGET_ARCH" in
+            x86_64) A=x86_64 ;;
+            arm64)  A=aarch64 ;;
+          esac
+
+          # xtool 1.24.0 uses darwinTools 1.1.0 / OpenAppleMacros 1.4.1.
+          # Bump these if you change XTOOL_VERSION (see SDKBuilder.swift).
+          TOOLS_V=1.1.0
+          OAM_V=1.4.1
+          base=https://github.com/xtool-org
+
+          get() {
+            curl -fL --retry 5 --retry-all-errors \
+              --connect-timeout 15 --max-time 600 -o "$1" "$2"
+          }
+
+          get xtool.app.zip \
+            "$base/xtool/releases/download/${XTOOL_VERSION}/xtool.app.zip"
+          get toolset.tar.gz \
+            "$base/darwin-tools-linux-llvm/releases/download/v${TOOLS_V}/toolset-${A}.tar.gz"
+          get oam.tar.gz \
+            "$base/OpenAppleMacros/releases/download/v${OAM_V}/OpenAppleMacrosServer-${A}.tar.gz"
+
+          ls -lh xtool.app.zip toolset.tar.gz oam.tar.gz
+          unzip -tq xtool.app.zip
+          tar -tzf toolset.tar.gz >/dev/null
+          tar -tzf oam.tar.gz >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xtool-build-inputs
+          path: |
+            xtool.app.zip
+            toolset.tar.gz
+            oam.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
   export:
-    # xcode-27 = Xcode 27 preview image (arm64).
-    # Use macos-26 for Xcode 26.x, macos-15 for Xcode 16.x.
+    needs: fetch
     runs-on: xcode-27
     timeout-minutes: 180
-
     env:
       XCODE_INPUT: ${{ inputs.xcode }}
       TARGET_ARCH: ${{ inputs.arch }}
-      XTOOL_VERSION: ${{ inputs.xtool_version }}
 
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xtool-build-inputs
+          path: ${{ runner.temp }}
+
       - name: Resolve Xcode
         shell: bash
         run: |
-          set -euo pipefail
-          ls -d /Applications/Xcode*.app 2>/dev/null || true
-
+          set -euxo pipefail
           if [[ -n "$XCODE_INPUT" ]]; then
             xcode="$XCODE_INPUT"
           else
             xcode="$(xcode-select -p)"
             xcode="${xcode%/Contents/Developer}"
           fi
-
-          [[ -d "$xcode/Contents/Developer" ]] || {
-            echo "error: not an Xcode.app: $xcode" >&2
-            exit 1
-          }
-
+          [[ -d "$xcode/Contents/Developer" ]] || { echo "not an Xcode.app: $xcode" >&2; exit 1; }
           echo "XCODE=$xcode" >> "$GITHUB_ENV"
-          echo "Using: $xcode"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-            "$xcode/Contents/Info.plist" 2>/dev/null || true
-          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version 2>/dev/null || true
+            "$xcode/Contents/Info.plist" || true
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version || true
           df -h /
 
-      - name: Install xtool ${{ inputs.xtool_version }}
+      - name: Install xtool (artifact only, no network)
         shell: bash
         run: |
-          set -euo pipefail
-          url="https://github.com/xtool-org/xtool/releases/download/${XTOOL_VERSION}/xtool.app.zip"
-          curl -fL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/xtool.app.zip" "$url"
-          unzip -q "$RUNNER_TEMP/xtool.app.zip" -d "$RUNNER_TEMP"
+          set -euxo pipefail
+          unzip -oq "$RUNNER_TEMP/xtool.app.zip" -d "$RUNNER_TEMP"
 
           xtool="$RUNNER_TEMP/xtool.app/Contents/MacOS/xtool"
           chmod +x "$xtool"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/xtool.app" 2>/dev/null || true
           echo "XTOOL=$xtool" >> "$GITHUB_ENV"
-          "$xtool" --version
+
+          # Fail in 60s instead of hanging forever if the binary can't launch.
+          python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], timeout=60).returncode)' \
+            "$xtool" --version
 
       - name: Build portable Darwin SDK
         shell: bash
+        env:
+          XTL_TOOLSET_TARBALL: ${{ runner.temp }}/toolset.tar.gz
+          XTL_OAM_TARBALL: ${{ runner.temp }}/oam.tar.gz
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/sdk"
           "$XTOOL" sdk build "$XCODE" "$RUNNER_TEMP/sdk" --arch "$TARGET_ARCH"
 
-          echo "--- SDK size ---"
           du -sh "$RUNNER_TEMP/sdk/darwin.xtoolsdk"
-
-          echo "--- iOS SDKs included ---"
           ls "$RUNNER_TEMP/sdk/darwin.xtoolsdk/Developer/Platforms/iPhoneOS.platform/Developer/SDKs"
 
       - name: Pack
@@ -90,19 +135,16 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/sdk"
           tar -czf "$RUNNER_TEMP/darwin-xtoolsdk-${TARGET_ARCH}.tar.gz" darwin.xtoolsdk
-
           cd "$RUNNER_TEMP"
           shasum -a 256 "darwin-xtoolsdk-${TARGET_ARCH}.tar.gz" \
             | tee "darwin-xtoolsdk-${TARGET_ARCH}.tar.gz.sha256"
-          ls -lh darwin-xtoolsdk-${TARGET_ARCH}.tar.gz*
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: darwin-xtoolsdk-${{ inputs.arch }}
           path: |
             ${{ runner.temp }}/darwin-xtoolsdk-${{ inputs.arch }}.tar.gz
             ${{ runner.temp }}/darwin-xtoolsdk-${{ inputs.arch }}.tar.gz.sha256
-          compression-level: 0   # already gzipped
+          compression-level: 0
           retention-days: 1
           if-no-files-found: error
